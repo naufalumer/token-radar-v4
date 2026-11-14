@@ -1454,6 +1454,32 @@ export function validateModel(sortedPeers: SnapshotProtocol[], model: ModelConst
     byCatErr.set(catKey, ce);
   };
 
+  /**
+   * One held-out token's two extra rule prices into the error lists: the
+   * calibrated multiple-only price, and the flat full formula (the
+   * uncalibrated full formula against the flat category median). Each gets
+   * its APE, its log-space error and its (price, truth) pair, plus the
+   * within-twice count and the win against the flat median — the same three
+   * measures recordRules keeps for the six main rules, split out here
+   * because these two rules are priced on different code paths and counted
+   * in their own lists. The flat error is the one baseline for both, computed
+   * once per token instead of once per rule.
+   */
+  const recordExtraRules = (calMultPred: number, fullFlat: number, trueV: number, flat: number): void => {
+    const flatErr = Math.abs(flat - trueV) / trueV;
+    const eCal = Math.abs(calMultPred - trueV) / trueV;
+    calErrs.push(eCal);
+    calLogErrs.push(Math.abs(Math.log10(calMultPred) - Math.log10(trueV)));
+    calPairs.push([calMultPred, trueV]);
+    if (calMultPred >= trueV / 2 && calMultPred <= trueV * 2) calWithin++;
+    if (eCal < flatErr) calWins++;
+    const eFullFlat = Math.abs(fullFlat - trueV) / trueV;
+    fullFlatErrs.push(eFullFlat);
+    fullFlatLog.push(Math.abs(Math.log10(fullFlat) - Math.log10(trueV)));
+    fullFlatPairs.push([fullFlat, trueV]);
+    if (fullFlat >= trueV / 2 && fullFlat <= trueV * 2) fullFlatWithin++;
+  };
+
   for (let fold = 0; fold < 5; fold++) {
     const test = sortedPeers.filter((_, i) => i % 5 === fold);
     const train = sortedPeers.filter((_, i) => i % 5 !== fold);
@@ -1471,17 +1497,7 @@ export function validateModel(sortedPeers: SnapshotProtocol[], model: ModelConst
       const preds = [flat, pooled, percat, withinPred, full, fullCal];
       const trueV = p.mcap_usd!;
       recordRules(preds, trueV, flat);
-      const eCal = Math.abs(calMultPred - trueV) / trueV;
-      calErrs.push(eCal);
-      calLogErrs.push(Math.abs(Math.log10(calMultPred) - Math.log10(trueV)));
-      calPairs.push([calMultPred, trueV]);
-      if (calMultPred >= trueV / 2 && calMultPred <= trueV * 2) calWithin++;
-      if (eCal < Math.abs(flat - trueV) / trueV) calWins++;
-      const eFullFlat = Math.abs(fullFlat - trueV) / trueV;
-      fullFlatErrs.push(eFullFlat);
-      fullFlatLog.push(Math.abs(Math.log10(fullFlat) - Math.log10(trueV)));
-      fullFlatPairs.push([fullFlat, trueV]);
-      if (fullFlat >= trueV / 2 && fullFlat <= trueV * 2) fullFlatWithin++;
+      recordExtraRules(calMultPred, fullFlat, trueV, flat);
       recordCategoryError(p, flat, pooled, trueV);
     }
   }
@@ -1663,6 +1679,32 @@ function chooseBoardProtocols(snapshot: Snapshot): SnapshotProtocol[] {
 /** One protocol with its priced value, ready to become a board row. */
 type ScoredProtocol = ReturnType<typeof impliedValue> & { p: SnapshotProtocol };
 
+/**
+ * The model breakdown one board row carries: the category multiple and how
+ * many peers backed it, the pooled size tilt and its R², the fitted multiple
+ * after the three weights, the three weights themselves, and the calibrated
+ * value against the raw formula value with the calibration's shift in
+ * decades. Kept apart from the row so the breakdown is one function's job —
+ * and so a reader can see exactly what the judge's detail view is built from.
+ */
+function modelBreakdown(s: ScoredProtocol, tiltR2: number): BoardRow['model'] {
+  return {
+    category_multiple: s.multiple.multiple,
+    multiple_peers: s.multiple.peers,
+    multiple_fallback: s.multiple.fallback,
+    size_tilt: round4(s.tilt),
+    size_tilt_basis: 'pooled — all live-token peers',
+    size_tilt_r2: tiltR2,
+    fitted_multiple: round4(s.fitted),
+    growth_pct: s.growthPct,
+    growth_multiplier: round4(s.growthMult),
+    maturity_multiplier: round4(s.maturityMult),
+    chain_multiplier: round4(s.chainMult),
+    raw_implied_value_usd: s.raw,
+    calibration_shift_dex: s.shiftDex,
+  };
+}
+
 /** One scored protocol's board row, at its rank, with the model breakdown attached. */
 function toBoardRow(s: ScoredProtocol, rank: number, tiltR2: number): BoardRow {
   return {
@@ -1681,21 +1723,7 @@ function toBoardRow(s: ScoredProtocol, rank: number, tiltR2: number): BoardRow {
     age_days: s.age,
     implied_value_usd: s.implied,
     signals: signalsFor(s.p, s.age),
-    model: {
-      category_multiple: s.multiple.multiple,
-      multiple_peers: s.multiple.peers,
-      multiple_fallback: s.multiple.fallback,
-      size_tilt: round4(s.tilt),
-      size_tilt_basis: 'pooled — all live-token peers',
-      size_tilt_r2: tiltR2,
-      fitted_multiple: round4(s.fitted),
-      growth_pct: s.growthPct,
-      growth_multiplier: round4(s.growthMult),
-      maturity_multiplier: round4(s.maturityMult),
-      chain_multiplier: round4(s.chainMult),
-      raw_implied_value_usd: s.raw,
-      calibration_shift_dex: s.shiftDex,
-    },
+    model: modelBreakdown(s, tiltR2),
     farm_steps: farmSteps(s.p, s.age).map(stepText),
   };
 }
@@ -1800,24 +1828,57 @@ export function gasFor(chain: string): string {
   return 'about $3 of gas';
 }
 
+/**
+ * The capital tiers: a position's size follows the protocol's own TVL, not
+ * a flat guess — a billion-dollar protocol is farmed with a bigger position
+ * than a $50M one, and the table makes the breakpoints visible instead of
+ * hiding them in a chain of ifs. The first tier whose floor the TVL clears
+ * wins; anything under $50M farms at $50.
+ */
+const CAPITAL_TIERS: { floor_usd: number; capital: number }[] = [
+  { floor_usd: 1_000_000_000, capital: 250 },
+  { floor_usd: 100_000_000, capital: 150 },
+  { floor_usd: 50_000_000, capital: 100 },
+];
+
 /** How much capital one farm position needs, from the protocol's own TVL. */
 function capitalFor(p: SnapshotProtocol): number {
-  if (p.tvl_usd >= 1_000_000_000) return 250;
-  if (p.tvl_usd >= 100_000_000) return 150;
-  if (p.tvl_usd >= 50_000_000) return 100;
+  for (const tier of CAPITAL_TIERS) {
+    if (p.tvl_usd >= tier.floor_usd) return tier.capital;
+  }
   return 50;
+}
+
+/**
+ * The hold in days from the protocol's age alone, before growth adjusts it:
+ * a young protocol needs the longest hold to show up in more than one
+ * snapshot; a seasoned one has already proven it stays, so 30 days is
+ * enough; an unknown age falls back to the middle. The growth adjustment
+ * lives apart, so the age rule reads on its own.
+ */
+function baseHoldDays(age: number | null): number {
+  if (age === null) return 45;
+  if (age < 180) return 60;
+  if (age < 365) return 45;
+  return 30;
+}
+
+/**
+ * The growth adjustment on a hold: a heating-up protocol (TVL up 20% or
+ * more in seven days) earns fifteen extra days to ride the attention rather
+ * than chase an entry after the spike; a cooling one (down 20% or more)
+ * loses fifteen, floored at 21 days so the position still counts in more
+ * than one snapshot. A flat week leaves the hold untouched.
+ */
+function adjustHoldDays(hold: number, growth: number | null): number {
+  if (growth !== null && growth >= 20) return hold + 15;
+  if (growth !== null && growth <= -20) return Math.max(21, hold - 15);
+  return hold;
 }
 
 /** How long to hold, from the protocol's age and its seven-day growth. */
 function holdDaysFor(age: number | null, growth: number | null): number {
-  let hold: number;
-  if (age === null) hold = 45;
-  else if (age < 180) hold = 60;
-  else if (age < 365) hold = 45;
-  else hold = 30;
-  if (growth !== null && growth >= 20) hold += 15;
-  if (growth !== null && growth <= -20) hold = Math.max(21, hold - 15);
-  return hold;
+  return adjustHoldDays(baseHoldDays(age), growth);
 }
 
 /** One category family's three recurring farm actions, as text builders. */
@@ -1988,23 +2049,46 @@ const ACTION_FAMILIES: FamilyActions[] = [
  * action, and the weekly habit — each written for what that kind of protocol
  * actually does. The family comes from the category's words, never the name.
  */
-function actionsFor(p: SnapshotProtocol, capital: number, chain: string): { main: string; second: string; weekly: string } {
-  const c = (p.category ?? '').toLowerCase();
-  const name = p.name;
+/**
+ * The first category family whose test matches, or undefined: the families
+ * are tried in their declared order, so a category that names two families
+ * (a staking bridge, say) always takes the earlier one. Kept apart from the
+ * action-building so the lookup is one function's job and the fallback below
+ * reads as exactly that — what happens when no family matches at all.
+ */
+function familyFor(category: string): FamilyActions | undefined {
+  const c = (category ?? '').toLowerCase();
   for (const family of ACTION_FAMILIES) {
-    if (family.test(c)) {
-      return {
-        main: family.main(name, capital, chain),
-        second: family.second(name, capital, chain),
-        weekly: family.weekly(name, capital, chain),
-      };
-    }
+    if (family.test(c)) return family;
   }
+  return undefined;
+}
+
+/**
+ * The generic farm actions for a protocol no family claims: a plain deposit
+ * as the main position, a weekly use as the second action, and a different
+ * qualifying action each week as the habit. Written out once here so the
+ * fallback is one named thing, not a literal object buried inside the
+ * lookup.
+ */
+function defaultActions(name: string, capital: number, chain: string): { main: string; second: string; weekly: string } {
   return {
     main: `Deposit $${capital} of USDC into ${name} on ${chain} and keep the position open so it counts in every snapshot.`,
     second: `Use ${name} once a week — a deposit, a swap or a vote — and keep the activity in the same wallet.`,
     weekly: `Do one different qualifying action each week — a deposit, a swap, a vote or a claim — and vary it.`,
   };
+}
+
+function actionsFor(p: SnapshotProtocol, capital: number, chain: string): { main: string; second: string; weekly: string } {
+  const family = familyFor(p.category ?? '');
+  if (family !== undefined) {
+    return {
+      main: family.main(p.name, capital, chain),
+      second: family.second(p.name, capital, chain),
+      weekly: family.weekly(p.name, capital, chain),
+    };
+  }
+  return defaultActions(p.name, capital, chain);
 }
 
 /** Everything the seven farm steps are built from, computed once per protocol. */
@@ -2023,23 +2107,34 @@ interface FarmPlan {
  * the protocol is young enough for the claim step's warning. The hold is
  * longer for young and heating-up protocols, shorter for cooling ones.
  */
+/**
+ * The hold step's reason, from the seven-day growth alone: a heating-up
+ * protocol (TVL up 20% or more) gets a warning to hold through the attention
+ * rather than chase an entry after the spike; a cooling one (down 20% or
+ * more) gets a warning to re-check TVL weekly and leave early if it keeps
+ * falling; a flat week needs no reason at all. Kept apart from the context
+ * assembly so the two warnings are one function's job.
+ */
+function holdReason(change7d: number | null): string {
+  if (change7d !== null && change7d >= 20) {
+    return ` TVL is up ${change7d.toFixed(1)}% in seven days, so hold through the attention rather than chasing an entry after the spike.`;
+  }
+  if (change7d !== null && change7d <= -20) {
+    return ` TVL is down ${Math.abs(change7d).toFixed(1)}% in seven days, so re-check the protocol's TVL every week and leave early if it keeps falling.`;
+  }
+  return '';
+}
+
 function farmPlanContext(p: SnapshotProtocol, age: number | null): FarmPlan {
   const chain = chainOf(p);
   const gas = gasFor(chain);
   const capital = capitalFor(p);
   const hold = holdDaysFor(age, p.change_7d);
-  const heating = p.change_7d !== null && p.change_7d >= 20;
-  const cooling = p.change_7d !== null && p.change_7d <= -20;
-  const holdWhy = heating
-    ? ` TVL is up ${p.change_7d!.toFixed(1)}% in seven days, so hold through the attention rather than chasing an entry after the spike.`
-    : cooling
-      ? ` TVL is down ${Math.abs(p.change_7d!).toFixed(1)}% in seven days, so re-check the protocol's TVL every week and leave early if it keeps falling.`
-      : '';
   return {
     gas,
     capital,
     hold,
-    holdWhy,
+    holdWhy: holdReason(p.change_7d),
     actions: actionsFor(p, capital, chain),
     young: age !== null && age < 180,
   };

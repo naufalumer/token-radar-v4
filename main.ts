@@ -161,6 +161,42 @@ function categoryCalibrationLine(board: BoardRow[]): string {
     .join('; ')}`;
 }
 
+/**
+ * The categories where the pooled tilt loses the median-error comparison
+ * against the flat category median, as "name (peers)" strings: naming the
+ * tilt's weak corners in the run summary, so a reader sees where the tilt
+ * loses instead of only its headline win. Kept apart from the summary so
+ * the filter is one function's job.
+ */
+function losingCategories(v: RadarData['calibration']['tilt_validation']): string[] {
+  return v.by_category
+    .filter((c) => c.median_ape_sized_pct > c.median_ape_flat_pct)
+    .map((c) => `${c.category} (${c.peers})`);
+}
+
+/**
+ * The pooled tilt's line of the run summary: the fitted slope, its damped
+ * value and R², the reference TVL, and the 5-fold median error and Spearman
+ * against the flat median. Kept apart from the rest of the summary so the
+ * tilt's story is one function's job.
+ */
+function tiltSummaryLine(radar: RadarData): string {
+  const v = radar.calibration.tilt_validation;
+  return `pooled tilt — slope ${radar.calibration.power_law.slope}, damped ${radar.calibration.power_law.slope_damped}, R2 ${radar.calibration.power_law.r2}, ref TVL $${radar.calibration.power_law.median_tvl_usd.toLocaleString('en-US')}; 5-fold median error ${v.median_ape_sized_pct.toFixed(1)}% vs ${v.median_ape_flat_pct.toFixed(1)}% flat, Spearman ${v.spearman_sized.toFixed(2)} vs ${v.spearman_flat.toFixed(2)} flat (${v.sized_wins}/${v.peers} priced closer)`;
+}
+
+/**
+ * The full formula's line of the run summary: median error, log error and
+ * within-2x against the flat full formula, the win count, and the losing
+ * categories. Kept apart from the rest of the summary so the full formula's
+ * story is one function's job.
+ */
+function fullFormulaLine(radar: RadarData): string {
+  const v = radar.calibration.tilt_validation;
+  const losingCats = losingCategories(v);
+  return `full formula — median error ${v.full_median_ape_sized_pct.toFixed(1)}% vs ${v.full_median_ape_flat_pct.toFixed(1)}% flat, log error ${v.full_log_mae_sized.toFixed(3)} vs ${v.full_log_mae_flat.toFixed(3)} flat, within 2x ${v.full_within2x_sized_pct.toFixed(1)}% vs ${v.full_within2x_flat_pct.toFixed(1)}% flat (${v.full_sized_wins}/${v.peers} priced closer); tilt loses the median-error comparison in ${losingCats.length} categor${losingCats.length === 1 ? 'y' : 'ies'}${losingCats.length > 0 ? `: ${losingCats.join(', ')}` : ''}`;
+}
+
 reportSummary(snapshot, board, radar, dashFiles, shots, out);
 
 /**
@@ -181,17 +217,14 @@ function reportSummary(
 ): void {
   const v = radar.calibration.tilt_validation;
   const calLines = calibrationSummaryLines(radar);
-  const losingCats = v.by_category
-    .filter((c) => c.median_ape_sized_pct > c.median_ape_flat_pct)
-    .map((c) => `${c.category} (${c.peers})`);
   const candLine = v.candidates
     .map((c) => `${c.candidate}: median ${c.median_ape_pct.toFixed(1)}%, log ${c.log_mae.toFixed(3)}, within-2x ${c.within2x_pct.toFixed(1)}%`)
     .join(' | ');
   process.stdout.write(
     `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
       `token radar: top implied value $${board[0]!.implied_value_usd.toLocaleString('en-US')} (${board[0]!.slug}), median $${board[Math.floor(board.length / 2)]!.implied_value_usd.toLocaleString('en-US')}\n` +
-      `token radar: pooled tilt — slope ${radar.calibration.power_law.slope}, damped ${radar.calibration.power_law.slope_damped}, R2 ${radar.calibration.power_law.r2}, ref TVL $${radar.calibration.power_law.median_tvl_usd.toLocaleString('en-US')}; 5-fold median error ${v.median_ape_sized_pct.toFixed(1)}% vs ${v.median_ape_flat_pct.toFixed(1)}% flat, Spearman ${v.spearman_sized.toFixed(2)} vs ${v.spearman_flat.toFixed(2)} flat (${v.sized_wins}/${v.peers} priced closer)\n` +
-      `token radar: full formula — median error ${v.full_median_ape_sized_pct.toFixed(1)}% vs ${v.full_median_ape_flat_pct.toFixed(1)}% flat, log error ${v.full_log_mae_sized.toFixed(3)} vs ${v.full_log_mae_flat.toFixed(3)} flat, within 2x ${v.full_within2x_sized_pct.toFixed(1)}% vs ${v.full_within2x_flat_pct.toFixed(1)}% flat (${v.full_sized_wins}/${v.peers} priced closer); tilt loses the median-error comparison in ${losingCats.length} categor${losingCats.length === 1 ? 'y' : 'ies'}${losingCats.length > 0 ? `: ${losingCats.join(', ')}` : ''}\n` +
+      `token radar: ${tiltSummaryLine(radar)}\n` +
+      `token radar: ${fullFormulaLine(radar)}\n` +
       `token radar: ${calLines.nestedLine}\n` +
       `token radar: ${calLines.fittedLine}\n` +
       `token radar: ${categoryCalibrationLine(board)}\n` +
