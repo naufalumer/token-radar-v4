@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token Radar — which pre-token protocol is worth farming next</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="pulse" aria-hidden="true"></span><h1>TOKEN RADAR</h1></div>
+  <p class="tag">Every protocol DefiLlama tracks, ranked by what its token launch would be worth — and how to farm each one before it happens.</p>
+  <p class="meta" id="meta">Loading snapshot…</p>
+  <div class="stats" id="stats"></div>
+  <nav class="tabs" aria-label="Views">
+    <button data-tab="board" class="active" type="button">Board</button>
+    <button data-tab="live" type="button">Live tokens</button>
+    <button data-tab="model" type="button">The model</button>
+  </nav>
+</header>
+
+<main>
+  <section id="tab-board" class="tab active">
+    <div class="picks" id="picks"></div>
+    <div class="modelstrip" id="modelstrip">Pricing the board…</div>
+    <div class="controls">
+      <label>Search <input id="q" type="search" placeholder="protocol name or slug" autocomplete="off"></label>
+      <label>Chain <select id="chain"><option value="">All chains</option></select></label>
+      <label>Category <select id="cat"><option value="">All categories</option></select></label>
+      <label>Sort <select id="sort">
+        <option value="implied">Implied value ↓</option>
+        <option value="tvl">TVL ↓</option>
+        <option value="growth">7-day growth ↓</option>
+        <option value="age">Age ↓</option>
+        <option value="name">Name A–Z</option>
+      </select></label>
+      <label class="check"><input id="watchonly" type="checkbox"> Watchlist only</label>
+      <label class="check"><input id="hotonly" type="checkbox"> Heating up</label>
+      <label class="check"><input id="earlyonly" type="checkbox"> Early (young)</label>
+    </div>
+    <p class="count" id="count"></p>
+    <div class="tablewrap">
+    <table id="board">
+      <thead><tr>
+        <th class="num">#</th><th>Protocol</th><th>Category</th><th>Chains</th>
+        <th class="num">TVL</th><th class="num">7d</th><th class="num">Age</th>
+        <th class="num">Implied value</th><th>Signals</th><th></th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    </div>
+    <p class="note">Implied value is this radar's own claim, computed from the snapshot — never a market price. “Records no token” means DefiLlama's record carries none; it is not proof the protocol has none.</p>
+  </section>
+
+  <section id="tab-live" class="tab">
+    <h2>Live tokens — the market's own values</h2>
+    <p>These protocols already trade, so the board does not rank them. Their market-cap-to-TVL ratios are the calibration the model learns from: the median ratio per category sets the multiple every pre-token protocol in that category is valued at, and the one pooled size tilt is fitted on all of them together.</p>
+    <div class="tablewrap">
+    <table>
+      <thead><tr><th>Protocol</th><th>Category</th><th class="num">TVL</th><th class="num">Market cap</th><th class="num">mcap / TVL</th><th class="num">7d</th></tr></thead>
+      <tbody id="live"></tbody>
+    </table>
+    </div>
+  </section>
+
+  <section id="tab-model" class="tab">
+    <h2>The model — radar-5, one pooled tilt plus an out-of-fold calibration</h2>
+    <div class="formula">
+      <p><strong>implied = calibrate(TVL × fitted multiple × growth × maturity × chain reach)</strong>, where <strong>fitted multiple = category multiple × size tilt</strong></p>
+      <ul>
+        <li><strong>Category multiple</strong> — median market-cap / TVL of the live-token protocols in the same category (3+ peers), else the whole-market median; clamped to 0.02–1.00.</li>
+        <li><strong>Size tilt — one pooled fit, not one per category.</strong> Log(market cap) regressed on log(TVL) over all 119 live-token protocols at once (CEX excluded); slope 0.47, R² 0.14. The tilt is 1 at the market's median live TVL ($27.3M) and is applied at half the fitted strength, clamped to 0.50–1.50, because the fit is weak and a full-strength tilt would price the giants 8× below their own category's peers, an extrapolation, not a measurement. A bigger protocol usually trades at a lower multiple.</li>
+        <li><strong>Growth</strong> — 1 + clamp(7-day TVL change, −50%, +100%) × 0.6.</li>
+        <li><strong>Maturity</strong> — 0.70 + min(age, 1095 days) / 1095 × 0.30; unknown age counts as 365 days.</li>
+        <li><strong>Chain reach</strong> — 1 + min(chains − 1, 5) × 0.02.</li>
+        <li><strong>Calibration — out-of-fold shrinkage on the full formula.</strong> The raw formula's errors are worst in the tails: its median error barely moved against the flat median while its trimmed mean fell hard, which says the middle is fine and the extremes are wrong. So a winsorized log-space line, fitted only on out-of-fold predictions of the 119 live peers, maps log(raw) to log(calibrated) and pulls the extremes back toward the truth. The map is monotone, the shift for any one protocol is capped at ±0.75 decades (about 5.6×), and the numbers below are the honest nested measurement — each fold's map fitted without that fold's peers — not the fitted layer's view of its own training data.</li>
+      </ul>
+      <p id="valid">Validating the tilt…</p>
+      <p id="calibtext">Fitting the calibration…</p>
+      <p>Why one pooled fit: per-category fits were run and rejected on the evidence — with 5 to 15 live peers per category they lose to the pooled fit on five of the six validation checks (see the table below). Fitting one slope per category sounds more precise; on 119 tokens it is mostly noise wearing a slope. The within-category slope was run too and ties the pooled fit, so it stays out for no gain.</p>
+      <p>No protocol name is special-cased. The calibration table below is recomputed from whatever snapshot the program is handed, so the radar keeps working on protocols that do not exist yet.</p>
+    </div>
+    <h3>Calibration — what the shrinkage did</h3>
+    <p>Out-of-fold predictions of the 119 live peers, before and after the calibration map. The “fitted view” is the map's own look at the predictions it was fitted on; the nested numbers in the validation table below are the honest measure, where each fold's map never saw the tokens it priced.</p>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Out-of-fold, 119 live peers</th><th class="num">Log error</th><th class="num">Median error</th><th class="num">Trimmed mean</th></tr></thead>
+      <tbody id="calibtable"></tbody>
+    </table></div>
+    <h3>Most moved by the calibration — the board's extremes, pulled back</h3>
+    <p>The ten board rows the calibration moved the farthest, with the raw value it started from. A negative shift pulls an overestimate down; a positive one lifts an underestimate up. The shift is capped at ±0.75 decades, so no row is ever dragged further than that.</p>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Protocol</th><th class="num">Raw value</th><th class="num">Calibrated value</th><th class="num">Shift (decades)</th></tr></thead>
+      <tbody id="shrunk"></tbody>
+    </table></div>
+    <h3>Calibration — market-cap / TVL by category</h3>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Category</th><th class="num">Multiple</th><th class="num">Live peers</th><th>Source</th></tr></thead>
+      <tbody id="calib"></tbody>
+    </table></div>
+    <h3>What was tested — six pricing rules, same five folds, six checks each</h3>
+    <p>Each held-out live token is priced six ways, each fold's training peers fitting the rule exactly as the board fits it. Wins are counted against the flat category median for every rule, one baseline for the whole table. The shipped rule is the full formula with calibration; the pooled tilt is its multiple.</p>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Rule</th><th class="num">Median error</th><th class="num">Trimmed mean</th><th class="num">Wins / 119</th><th class="num">Spearman</th><th class="num">Log error</th><th class="num">Within 2×</th></tr></thead>
+      <tbody id="cand"></tbody>
+    </table></div>
+    <h3>Where the tilt wins and loses — by category</h3>
+    <p>Median error per category, flat median vs pooled tilt. A category the tilt loses in is named here, not hidden by the global median — the run summary names the same losing categories.</p>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Category</th><th class="num">Peers</th><th class="num">Median error, flat</th><th class="num">Median error, tilt</th><th class="num">Tilt wins</th><th>Verdict</th></tr></thead>
+      <tbody id="bycat"></tbody>
+    </table></div>
+    <h3>Sandbox — move the dials, watch the board re-rank</h3>
+    <p>Change a weight and the top 10 re-ranks live, from the same snapshot figures. The board above always shows the published model; this is the reader's what-if. Tilt strength 1 is the published half-strength tilt; 0 is no tilt at all. Calibration strength 1 is the published map; 0 is the raw formula with no shrinkage.</p>
+    <div class="sandbox">
+      <label>Growth weight <input id="sb-growth" type="range" min="0" max="1.5" step="0.05" value="0.6"> <output id="sb-growth-v">0.60</output></label>
+      <label>Maturity weight <input id="sb-mat" type="range" min="0" max="0.6" step="0.02" value="0.3"> <output id="sb-mat-v">0.30</output></label>
+      <label>Tilt strength <input id="sb-tilt" type="range" min="0" max="1.5" step="0.05" value="1"> <output id="sb-tilt-v">1.00</output></label>
+      <label>Multiple cap <input id="sb-cap" type="range" min="0.2" max="2" step="0.05" value="1"> <output id="sb-cap-v">1.00</output></label>
+      <label>Calibration strength <input id="sb-cal" type="range" min="0" max="1.5" step="0.05" value="1"> <output id="sb-cal-v">1.00</output></label>
+      <ol id="sb-top"></ol>
+    </div>
+  </section>
+
+  <section id="detail" class="detail" hidden>
+    <button id="detail-close" type="button">← Back to the board</button>
+    <div id="detail-body"></div>
+  </section>
+</main>
+
+<footer>
+  <p>Snapshot: <span id="src"></span>. Board ranks pre-token protocols only; live-token protocols appear at their market values. A protocol's implied value is the entry's own claim, never make.fun's, and never a prediction that a token will be issued.</p>
+  <p>Method: TVL × fitted multiple (category median × one pooled size tilt, fitted from 119 live-token peers) × growth × maturity × chain reach, then calibrated by an out-of-fold log-space map. Farm plans are derived from each protocol's category, chains, TVL, age and seven-day growth — never from a hand-kept list of names. Gas costs follow the chain's own fee market.</p>
+</footer>
+<script src="../data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
