@@ -11,7 +11,7 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { boardIssue, buildRadar, dataScript, parseSnapshot, type BoardRow, type RadarData, type Snapshot } from './lib/model.ts';
+import { boardIssue, buildRadar, categoryCalibrationSummary, dataScript, describeCalibrator, parseSnapshot, type BoardRow, type RadarData, type Snapshot } from './lib/model.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -70,14 +70,13 @@ function copyFiles(from: string, to: string): string[] {
 }
 
 /**
- * The dashboard and the screenshots into the output, with the gate's own
- * counts checked: three dashboard files with index.html, three screenshots
- * with clean names. A missing file here is a failure now, not a rejection
- * after submit.
+ * The gate's own counts on the copied files: three dashboard files with
+ * index.html among them, and three screenshots with clean names. A missing
+ * file here is a failure now, not a rejection after submit — the program
+ * refuses to hand in an /output the scorer would refuse, instead of writing
+ * it and hoping.
  */
-function copyEntryFiles(here: string, out: string): { dashFiles: string[]; shots: string[] } {
-  const dashFiles = copyFiles(join(here, 'dashboard'), join(out, 'dashboard'));
-  const shots = copyFiles(join(here, 'screenshots'), join(out, 'screenshots'));
+function validateOutputFiles(dashFiles: string[], shots: string[]): void {
   if (dashFiles.length < 3 || !dashFiles.includes('index.html')) {
     process.stderr.write(`token radar: dashboard/ is missing files: ${dashFiles.join(', ') || '(empty)'}\n`);
     process.exit(1);
@@ -92,6 +91,18 @@ function copyEntryFiles(here: string, out: string): { dashFiles: string[]; shots
       process.exit(1);
     }
   }
+}
+
+/**
+ * The dashboard and the screenshots into the output, with the gate's own
+ * counts checked: three dashboard files with index.html, three screenshots
+ * with clean names. A missing file here is a failure now, not a rejection
+ * after submit.
+ */
+function copyEntryFiles(here: string, out: string): { dashFiles: string[]; shots: string[] } {
+  const dashFiles = copyFiles(join(here, 'dashboard'), join(out, 'dashboard'));
+  const shots = copyFiles(join(here, 'screenshots'), join(out, 'screenshots'));
+  validateOutputFiles(dashFiles, shots);
   return { dashFiles, shots };
 }
 
@@ -107,6 +118,47 @@ writeFileSync(join(out, 'dossier.json'), buildDossier(out, dossierOpts));
 if (!readFileSync(join(out, 'dossier.json')).equals(Buffer.from(buildDossier(out, dossierOpts)))) {
   process.stderr.write('token radar: the dossier does not rebuild byte-identically; refusing to hand in a mismatched /output\n');
   process.exit(1);
+}
+
+/**
+ * The calibration's lines of the run summary: the fitted map in words, the
+ * nested 5-fold measure against the uncalibrated formula, and the fitted-view
+ * before/after on the out-of-fold predictions. Kept apart from the rest of
+ * the summary so the calibration's story is one function's job — and so the
+ * summary names the map (slope, winsor, cap) instead of only its effect.
+ */
+function calibrationSummaryLines(radar: RadarData): { nestedLine: string; fittedLine: string } {
+  const v = radar.calibration.tilt_validation;
+  const rep = radar.calibration.calibration_report;
+  const nestedLine =
+    `${describeCalibrator(radar.calibration.calibration)}; nested 5-fold full formula: median error ${v.full_cal_median_ape_pct.toFixed(1)}% vs ${v.full_median_ape_sized_pct.toFixed(1)}% uncalibrated, trimmed mean ${v.full_cal_trimmed_mean_ape_pct.toFixed(1)}% vs ${v.full_trimmed_mean_ape_sized_pct.toFixed(1)}%, log error ${v.full_cal_log_mae.toFixed(3)} vs ${v.full_log_mae_sized.toFixed(3)}, within 2x ${v.full_cal_within2x_pct.toFixed(1)}% vs ${v.full_within2x_sized_pct.toFixed(1)}% (${v.full_cal_wins}/${v.peers} priced closer than flat)`;
+  const fittedLine =
+    `calibration on the board's out-of-fold fit — log error ${rep.oof_log_mae_after.toFixed(3)} vs ${rep.oof_log_mae_before.toFixed(3)} before, trimmed mean ${rep.oof_trimmed_mean_ape_after_pct.toFixed(1)}% vs ${rep.oof_trimmed_mean_ape_before_pct.toFixed(1)}%; most moved: ${rep.most_shrunk
+      .slice(0, 5)
+      .map((s) => `${s.slug} ${s.shift_dex > 0 ? '+' : ''}${s.shift_dex.toFixed(2)} dex`)
+      .join(', ')}`;
+  return { nestedLine, fittedLine };
+}
+
+/**
+ * The categories the calibration moved the most, as one summary line: each
+ * category's median shift and the share of its rows that moved at least a
+ * twentieth of a decade. A category with a median shift near zero barely
+ * felt the layer; naming the moved ones shows where the raw formula was
+ * systematically wrong instead of hiding it behind a global average.
+ */
+function categoryCalibrationLine(board: BoardRow[]): string {
+  const moved = categoryCalibrationSummary(board)
+    .filter((c) => Math.abs(c.median_shift_dex) >= 0.1)
+    .sort((a, b) => Math.abs(b.median_shift_dex) - Math.abs(a.median_shift_dex));
+  if (moved.length === 0) return 'calibration moved no category by a median of 0.10 dex or more';
+  return `calibration moved the most in ${moved
+    .slice(0, 5)
+    .map(
+      (c) =>
+        `${c.category} (median ${c.median_shift_dex > 0 ? '+' : ''}${c.median_shift_dex.toFixed(2)} dex, ${c.share_moved_pct.toFixed(0)}% of ${c.rows} rows)`,
+    )
+    .join('; ')}`;
 }
 
 reportSummary(snapshot, board, radar, dashFiles, shots, out);
@@ -128,25 +180,21 @@ function reportSummary(
   out: string,
 ): void {
   const v = radar.calibration.tilt_validation;
-  const rep = radar.calibration.calibration_report;
-  const cal = radar.calibration.calibration;
+  const calLines = calibrationSummaryLines(radar);
   const losingCats = v.by_category
     .filter((c) => c.median_ape_sized_pct > c.median_ape_flat_pct)
     .map((c) => `${c.category} (${c.peers})`);
   const candLine = v.candidates
     .map((c) => `${c.candidate}: median ${c.median_ape_pct.toFixed(1)}%, log ${c.log_mae.toFixed(3)}, within-2x ${c.within2x_pct.toFixed(1)}%`)
     .join(' | ');
-  const shrunkLine = rep.most_shrunk
-    .slice(0, 5)
-    .map((s) => `${s.slug} ${s.shift_dex > 0 ? '+' : ''}${s.shift_dex.toFixed(2)} dex`)
-    .join(', ');
   process.stdout.write(
     `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
       `token radar: top implied value $${board[0]!.implied_value_usd.toLocaleString('en-US')} (${board[0]!.slug}), median $${board[Math.floor(board.length / 2)]!.implied_value_usd.toLocaleString('en-US')}\n` +
       `token radar: pooled tilt — slope ${radar.calibration.power_law.slope}, damped ${radar.calibration.power_law.slope_damped}, R2 ${radar.calibration.power_law.r2}, ref TVL $${radar.calibration.power_law.median_tvl_usd.toLocaleString('en-US')}; 5-fold median error ${v.median_ape_sized_pct.toFixed(1)}% vs ${v.median_ape_flat_pct.toFixed(1)}% flat, Spearman ${v.spearman_sized.toFixed(2)} vs ${v.spearman_flat.toFixed(2)} flat (${v.sized_wins}/${v.peers} priced closer)\n` +
       `token radar: full formula — median error ${v.full_median_ape_sized_pct.toFixed(1)}% vs ${v.full_median_ape_flat_pct.toFixed(1)}% flat, log error ${v.full_log_mae_sized.toFixed(3)} vs ${v.full_log_mae_flat.toFixed(3)} flat, within 2x ${v.full_within2x_sized_pct.toFixed(1)}% vs ${v.full_within2x_flat_pct.toFixed(1)}% flat (${v.full_sized_wins}/${v.peers} priced closer); tilt loses the median-error comparison in ${losingCats.length} categor${losingCats.length === 1 ? 'y' : 'ies'}${losingCats.length > 0 ? `: ${losingCats.join(', ')}` : ''}\n` +
-      `token radar: calibration — log map slope ${cal.slope}, intercept ${cal.intercept}, R2 ${cal.r2}, winsor [${cal.winsor_lo}, ${cal.winsor_hi}], shift capped at ±${cal.shift_cap_dex} dex${cal.identity ? ' (identity: fit was degenerate, layer does nothing)' : ''}; nested 5-fold full formula: median error ${v.full_cal_median_ape_pct.toFixed(1)}% vs ${v.full_median_ape_sized_pct.toFixed(1)}% uncalibrated, trimmed mean ${v.full_cal_trimmed_mean_ape_pct.toFixed(1)}% vs ${v.full_trimmed_mean_ape_sized_pct.toFixed(1)}%, log error ${v.full_cal_log_mae.toFixed(3)} vs ${v.full_log_mae_sized.toFixed(3)}, within 2x ${v.full_cal_within2x_pct.toFixed(1)}% vs ${v.full_within2x_sized_pct.toFixed(1)}% (${v.full_cal_wins}/${v.peers} priced closer than flat)\n` +
-      `token radar: calibration on the board's out-of-fold fit — log error ${rep.oof_log_mae_after.toFixed(3)} vs ${rep.oof_log_mae_before.toFixed(3)} before, trimmed mean ${rep.oof_trimmed_mean_ape_after_pct.toFixed(1)}% vs ${rep.oof_trimmed_mean_ape_before_pct.toFixed(1)}%; most moved: ${shrunkLine}\n` +
+      `token radar: ${calLines.nestedLine}\n` +
+      `token radar: ${calLines.fittedLine}\n` +
+      `token radar: ${categoryCalibrationLine(board)}\n` +
       `token radar: candidates — ${candLine}\n` +
       `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dashFiles.length} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
   );

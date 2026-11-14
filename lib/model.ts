@@ -71,6 +71,31 @@
 // the calibration table is recomputed from whatever snapshot the program is handed,
 // so the radar keeps working on a future snapshot whose protocols do not exist yet.
 
+// How this file is laid out, for a reader who has never seen it. The model
+// is one pipeline, and the sections below follow it in order:
+//
+//   1. the snapshot's shape          (SnapshotProtocol, Snapshot)
+//   2. the model's constants         (ModelConstants, MODEL, MODEL_VERSION)
+//   3. the tables the board is built from
+//      (CategoryMultiple, PowerLawFit, CategoryBasis, the validation and
+//       calibration reports)
+//   4. the board's rows               (BoardRow, RadarRow, LiveRow, RadarData)
+//   5. the small maths                (median, quantile, leastSquares,
+//       ranks, spearman, the damped slope and the tilt, the three weights)
+//   6. the calibration layer         (fitCalibrator, calibrateValue, the
+//       per-category calibration summary)
+//   7. the validation                 (fold contexts, out-of-fold predictions,
+//       the six pricing rules, the summary tables)
+//   8. the board itself               (calibrate, buildBoard, farm plans,
+//       the dashboard data, the snapshot parser, the gate)
+//
+// Nothing in sections 1-4 decides a price; nothing in 5-8 is printed on the
+// dashboard except through the tables of section 3. A change to a weight in
+// section 5 is measured by section 7 before it can move a row in section 8,
+// and a change to a row in section 8 is refused by the gate at the end of
+// the file unless the board still covers the watchlist, ranks 1..n and
+// orders by value.
+
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
   slug: string;
@@ -467,6 +492,28 @@ function medianPct(errs: number[]): number {
   return round4((median([...errs].sort((a, b) => a - b)) ?? 0) * 100);
 }
 
+/**
+ * The trimmed mean of a list of errors as a percentage: the worst tenth set
+ * aside before averaging, so one wild token cannot decide it. Shared by the
+ * validation summary and the calibration report, so the two tables trim the
+ * same way — a trimmed mean that differed between tables by definition would
+ * make the model tab disagree with itself.
+ */
+export function trimmedMeanPct(errs: number[]): number {
+  const s = [...errs].sort((x, y) => x - y).slice(0, Math.floor(errs.length * 0.9));
+  return round4((s.reduce((sum, e) => sum + e, 0) / s.length) * 100);
+}
+
+/**
+ * The plain mean of a list of numbers, rounded like every number the model
+ * prints. The log-space mean error: it prices an overestimate and an
+ * underestimate symmetrically, where APE caps an underestimate at 100% but
+ * lets an overestimate run away.
+ */
+export function meanOf(values: number[]): number {
+  return round4(values.reduce((sum, v) => sum + v, 0) / values.length);
+}
+
 /** A whole day count from `from` to `to`, clamped at zero; null when either date is absent. */
 export function ageDays(asOf: string, listedAt: string | null): number | null {
   if (listedAt === null) return null;
@@ -599,14 +646,37 @@ function withinCategorySlope(peers: SnapshotProtocol[]): number {
 }
 
 /**
+ * A fitted slope at half the strength the regression found: the pooled fit is
+ * weak (R2 0.143), so the shipped tilt moves the fitted slope halfway toward
+ * 1 — a slope of 1 means no size effect at all — instead of applying the full
+ * pull. One helper, because the same half-strength rule applies to the pooled
+ * fit, to each per-category fit and to the within-category slope, and three
+ * copies of `1 + (slope - 1) * damping` can drift apart without any test
+ * noticing. The damping itself is the model's size_damping constant.
+ */
+export function dampedSlope(slope: number, model: ModelConstants): number {
+  return 1 + (slope - 1) * model.size_damping;
+}
+
+/**
+ * One TVL's tilt under a damped slope and a reference TVL: 1 at the reference,
+ * below 1 for giants, above 1 for the small, clamped to the model's floor and
+ * cap so no protocol is ever tilted out of the table's range. The exponent is
+ * the damped slope minus one, so a damped slope of exactly 1 is a tilt of 1
+ * at every size — the identity, not a guess.
+ */
+export function tiltValue(tvlUsd: number, slopeDamped: number, refTvlUsd: number, model: ModelConstants): number {
+  const raw = Math.pow(tvlUsd / refTvlUsd, slopeDamped - 1);
+  return Math.min(model.tilt_cap, Math.max(model.tilt_floor, raw));
+}
+
+/**
  * The size tilt for one TVL: 1 at the reference (median) TVL, less for giants, more
  * for the small. One pooled fit, one pooled reference — the whole market's size
  * effect, not a per-category guess.
  */
 export function sizeTilt(tvlUsd: number, fit: { slope: number; median_tvl_usd: number }, model: ModelConstants): number {
-  const damped = 1 + (fit.slope - 1) * model.size_damping;
-  const raw = Math.pow(tvlUsd / fit.median_tvl_usd, damped - 1);
-  return Math.min(model.tilt_cap, Math.max(model.tilt_floor, raw));
+  return tiltValue(tvlUsd, dampedSlope(fit.slope, model), fit.median_tvl_usd, model);
 }
 
 /** Ranks with average ties: equal values share the mean of the ranks they span. */
@@ -729,6 +799,43 @@ export interface Multipliers {
 }
 
 /**
+ * The growth weight from a protocol's seven-day TVL change: the change is
+ * clamped to the model's floor and cap first, so one week of +400% cannot
+ * buy a protocol four times its value, and a -90% week cannot erase it.
+ * Returns the clamped percentage and the multiplier together, because the
+ * board shows both — the percentage the reader sees and the weight the
+ * pricing used.
+ */
+export function growthMultiplier(change7d: number | null, model: ModelConstants): { growthPct: number; growth: number } {
+  const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, finite(change7d, 0)));
+  return { growthPct, growth: 1 + (growthPct / 100) * model.growth_weight };
+}
+
+/**
+ * The maturity weight from a protocol's age in days: seven-tenths at birth,
+ * rising linearly to one at the model's maturity horizon. An unknown age
+ * takes the model's unknown-age days, so a protocol with no listing date
+ * prices like a year-old one rather than a newborn or an ancient.
+ */
+export function maturityMultiplier(age: number | null, model: ModelConstants): number {
+  const ageForModel = age ?? model.unknown_age_days;
+  return (
+    model.maturity_floor +
+    (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range
+  );
+}
+
+/**
+ * The chain-reach weight from how many chains a protocol names: two percent
+ * per extra chain, capped at ten percent, because a protocol on six chains
+ * reaches further than one on one — but reach is not value, so the weight
+ * stops growing. A protocol with no chain listed takes the base weight of 1.
+ */
+export function chainMultiplier(chainCount: number, model: ModelConstants): number {
+  return 1 + Math.min(Math.max(chainCount - 1, 0), model.chain_max_extra) * model.chain_step;
+}
+
+/**
  * A protocol's growth, maturity and chain weights from its own record, in one
  * place: the shipped pricing, the full-formula validation and the board all
  * read these three numbers, so a change to a weight lands once instead of in
@@ -738,15 +845,48 @@ export interface Multipliers {
  * unknown-age days — the same fallback every caller used before.
  */
 export function multipliersFor(p: SnapshotProtocol, model: ModelConstants, asOf: string = ''): Multipliers {
-  const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, finite(p.change_7d, 0)));
-  const growth = 1 + (growthPct / 100) * model.growth_weight;
+  const { growthPct, growth } = growthMultiplier(p.change_7d, model);
   const age = asOf === '' ? null : ageDays(asOf, p.listed_at);
-  const ageForModel = age ?? model.unknown_age_days;
-  const maturity =
-    model.maturity_floor +
-    (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-  const chain = 1 + Math.min(Math.max(p.chains.length - 1, 0), model.chain_max_extra) * model.chain_step;
+  const maturity = maturityMultiplier(age, model);
+  const chain = chainMultiplier(p.chains.length, model);
   return { growthPct, growth, maturity, chain, age };
+}
+
+/**
+ * One protocol's priced parts under a category multiple and a size tilt:
+ * the fitted multiple (median x tilt, clamped), the three weights, and the
+ * raw full-formula value they price. One function for the shipped pricing
+ * and the validation's full-formula rule, so the two never disagree about
+ * what "the full formula" means — the value the board shows is the value
+ * the validation measured, down to the last rounding.
+ */
+export function pricingParts(
+  p: SnapshotProtocol,
+  categoryMultiple: number,
+  tilt: number,
+  model: ModelConstants,
+  asOf: string = '',
+): {
+  fitted: number;
+  growthPct: number;
+  growthMult: number;
+  maturityMult: number;
+  chainMult: number;
+  age: number | null;
+  raw: number;
+} {
+  const fitted = clampMultiple(categoryMultiple * tilt, model);
+  const m = multipliersFor(p, model, asOf);
+  const raw = Math.max(1, Math.round(p.tvl_usd * fitted * m.growth * m.maturity * m.chain));
+  return {
+    fitted,
+    growthPct: m.growthPct,
+    growthMult: m.growth,
+    maturityMult: m.maturity,
+    chainMult: m.chain,
+    age: m.age,
+    raw,
+  };
 }
 
 /**
@@ -761,9 +901,7 @@ export function fullFormulaValue(
   model: ModelConstants,
   asOf: string = '',
 ): number {
-  const fitted = clampMultiple(categoryMultiple * tilt, model);
-  const m = multipliersFor(p, model, asOf);
-  return Math.max(1, Math.round(p.tvl_usd * fitted * m.growth * m.maturity * m.chain));
+  return pricingParts(p, categoryMultiple, tilt, model, asOf).raw;
 }
 
 /**
@@ -786,6 +924,32 @@ export function identityCalibrator(peers: number, model: ModelConstants): Calibr
 }
 
 /**
+ * The winsorization bounds for a sorted list of log-predictions: the values at
+ * the model's low and high percentiles, by linear interpolation. Training
+ * predictions outside these bounds are clipped to them before any line is
+ * fitted, so one wild peer cannot bend the calibration for every protocol.
+ * Returns null when the bounds collapse — a spread of zero means the
+ * predictions carry no usable spread to fit on.
+ */
+export function winsorBounds(sortedXs: number[], model: ModelConstants): { lo: number; hi: number } | null {
+  const lo = quantile(sortedXs, model.calib_winsor_lo_pct / 100);
+  const hi = quantile(sortedXs, model.calib_winsor_hi_pct / 100);
+  if (!(hi > lo)) return null;
+  return { lo, hi };
+}
+
+/**
+ * The least-squares line of log true on log predicted, with its R squared,
+ * from two equal-length series. One helper for the calibration map, so the
+ * line's maths lives in one place: a fix to the regression lands once.
+ * A slope at or below zero means the predictions carry no usable signal about
+ * the truth in log space, and the caller falls back to the identity map.
+ */
+export function fitLogLine(xs: number[], ys: number[]): { slope: number; intercept: number; r2: number } {
+  return leastSquares(xs, ys);
+}
+
+/**
  * Fit the calibration map from out-of-fold prediction pairs: each pair is
  * (log10 of the price the fold model gave a held-out token, log10 of that
  * token's true market cap). The training predictions are winsorized at the
@@ -802,9 +966,9 @@ export function fitCalibrator(
   const n = pairs.length;
   if (n < 10) return identityCalibrator(n, model);
   const xsSorted = pairs.map(([x]) => x).sort((a, b) => a - b);
-  const lo = quantile(xsSorted, model.calib_winsor_lo_pct / 100);
-  const hi = quantile(xsSorted, model.calib_winsor_hi_pct / 100);
-  if (!(hi > lo)) return identityCalibrator(n, model);
+  const bounds = winsorBounds(xsSorted, model);
+  if (bounds === null) return identityCalibrator(n, model);
+  const { lo, hi } = bounds;
   const xs: number[] = [];
   const ys: number[] = [];
   for (const [x, y] of pairs) {
@@ -813,7 +977,7 @@ export function fitCalibrator(
     ys.push(y);
   }
   if (xs.length < 10) return identityCalibrator(n, model);
-  const { slope, intercept, r2 } = leastSquares(xs, ys);
+  const { slope, intercept, r2 } = fitLogLine(xs, ys);
   if (!Number.isFinite(slope) || !Number.isFinite(intercept) || slope <= 0) {
     return identityCalibrator(n, model);
   }
@@ -846,6 +1010,73 @@ export function calibrateValue(
   const y = cal.slope * xw + cal.intercept;
   const shift = Math.min(cal.shift_cap_dex, Math.max(-cal.shift_cap_dex, y - x));
   return { value: Math.max(1, Math.round(Math.pow(10, x + shift))), shiftDex: round4(shift) };
+}
+
+/**
+ * One category's share of the calibration's work on the finished board: how
+ * far the layer moved that category's rows, in decades, and how many of them
+ * it moved at all. A category whose rows barely move tells the reader the
+ * raw formula was already honest there; a category whose rows all moved a
+ * full cap tells the reader the raw formula was systematically wrong there.
+ * This summary is computed for the run summary only — deliberately NOT part
+ * of the serialized calibration object, so adding it cannot change the board,
+ * the dashboard data or the dossier by a byte.
+ */
+export interface CategoryCalibrationSummary {
+  category: string;
+  rows: number;
+  median_shift_dex: number;
+  mean_shift_dex: number;
+  max_abs_shift_dex: number;
+  share_moved_pct: number;
+}
+
+/**
+ * The per-category calibration summary of a finished board: the rows grouped
+ * by their own category, each group's shifts summarised. The median and mean
+ * shifts are rounded like every number the model prints, and a row counts as
+ * moved when its shift is at least a twentieth of a decade — a hundredth of
+ * a decade is rounding, not a move.
+ */
+export function categoryCalibrationSummary(board: BoardRow[]): CategoryCalibrationSummary[] {
+  const byCategory = new Map<string, number[]>();
+  for (const row of board) {
+    const key = row.category ?? 'Uncategorised';
+    const shifts = byCategory.get(key) ?? [];
+    shifts.push(row.model.calibration_shift_dex);
+    byCategory.set(key, shifts);
+  }
+  const out: CategoryCalibrationSummary[] = [];
+  for (const [category, shifts] of [...byCategory.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+    const sorted = [...shifts].sort((a, b) => a - b);
+    const moved = shifts.filter((s) => Math.abs(s) >= 0.05).length;
+    out.push({
+      category,
+      rows: shifts.length,
+      median_shift_dex: round4(median(sorted) ?? 0),
+      mean_shift_dex: round4(shifts.reduce((sum, s) => sum + s, 0) / shifts.length),
+      max_abs_shift_dex: round4(Math.max(...shifts.map((s) => Math.abs(s)))),
+      share_moved_pct: round4((moved / shifts.length) * 100),
+    });
+  }
+  return out;
+}
+
+/**
+ * One line that says what a fitted calibration map does, in words: the slope
+ * and intercept of the log line, the winsor bounds it was fitted inside, and
+ * the shift cap that binds it. An identity map says so plainly — the layer
+ * does nothing — rather than letting a slope of 1 and an intercept of 0 pass
+ * as a fitted map.
+ */
+export function describeCalibrator(cal: Calibrator): string {
+  if (cal.identity) {
+    return `calibration is an identity map — the fit was degenerate, so the layer changes no value (fitted on ${cal.peers} pairs)`;
+  }
+  return (
+    `calibration log map: log10(calibrated) = ${cal.slope} x log10(raw) + ${cal.intercept} ` +
+    `(R2 ${cal.r2}, winsor [${cal.winsor_lo}, ${cal.winsor_hi}] log10, shift capped at ±${cal.shift_cap_dex} dex, ${cal.peers} pairs)`
+  );
 }
 
 /** Everything one fold's training peers calibrate, once, for all the rules. */
@@ -887,7 +1118,7 @@ function buildFoldContext(train: SnapshotProtocol[], model: ModelConstants): Fol
   const medTvl = median(train.map((p) => p.tvl_usd).sort((a, b) => a - b)) ?? 1;
   const pooledFit: PowerLawFit = {
     slope: fit.slope,
-    slope_damped: 1 + (fit.slope - 1) * model.size_damping,
+    slope_damped: dampedSlope(fit.slope, model),
     r2: fit.r2,
     peers: train.length,
     median_tvl_usd: medTvl,
@@ -899,18 +1130,17 @@ function buildFoldContext(train: SnapshotProtocol[], model: ModelConstants): Fol
     const refTvl = list !== undefined ? median(list.map((p) => p.tvl_usd).sort((a, b) => a - b)) ?? medTvl : medTvl;
     if (list !== undefined && list.length >= 5) {
       const cf = fitPowerLaw(list);
-      if (cf.slope > 0 && cf.r2 >= 0) return { slopeDamped: 1 + (cf.slope - 1) * model.size_damping, refTvl };
+      if (cf.slope > 0 && cf.r2 >= 0) return { slopeDamped: dampedSlope(cf.slope, model), refTvl };
     }
     return { slopeDamped: pooledFit.slope_damped, refTvl };
   };
-  const withinSlopeDamped = 1 + (withinCategorySlope(train) - 1) * model.size_damping;
+  const withinSlopeDamped = dampedSlope(withinCategorySlope(train), model);
   return { catMedian, pooledFit, perCatFit, withinSlopeDamped, model };
 }
 
 /** The size tilt for one TVL under one fold's fit and reference. */
 function tiltFrom(tvl: number, slopeDamped: number, refTvl: number, ctx: FoldContext): number {
-  const raw = Math.pow(tvl / refTvl, slopeDamped - 1);
-  return Math.min(ctx.model.tilt_cap, Math.max(ctx.model.tilt_floor, raw));
+  return tiltValue(tvl, slopeDamped, refTvl, ctx.model);
 }
 
 /** One protocol's pooled-tilt multiple-only price and full-formula price under a fold. */
@@ -972,6 +1202,53 @@ interface ValidationAccumulators {
 }
 
 /**
+ * One rule's row in the candidates table, from the error lists one 5-fold
+ * run accumulated: the median error, the trimmed mean, the wins against the
+ * flat median, the rank correlation, the log-space error and the share
+ * within twice the true value. One row per rule, every rule on the same
+ * folds, so no rule is judged on a different draw.
+ */
+function candidateRow(
+  candidate: string,
+  errs: number[],
+  logErrs: number[],
+  pairs: [number, number][],
+  within: number,
+  wins: number,
+  peerCount: number,
+): CandidateCheck {
+  return {
+    candidate,
+    median_ape_pct: medianPct(errs),
+    trimmed_mean_ape_pct: trimmedMeanPct(errs),
+    wins,
+    peers: peerCount,
+    spearman: round4(spearman(pairs.map(([v]) => v), pairs.map(([, t]) => t))),
+    log_mae: meanOf(logErrs),
+    within2x_pct: round4((within / peerCount) * 100),
+  };
+}
+
+/**
+ * The per-category tilt table, from the per-category error lists: one row
+ * per category, alphabetical, with the median error of the flat median and
+ * of the pooled tilt side by side and how many of the category's tokens the
+ * tilt priced closer. A category the tilt loses in shows up here, not hidden
+ * by the global median.
+ */
+function categoryRows(byCatErr: Map<string, { flat: number[]; sized: number[]; wins: number }>): CategoryValidation[] {
+  return [...byCatErr.entries()]
+    .sort((x, y) => (x[0] < y[0] ? -1 : 1))
+    .map(([category, e]) => ({
+      category,
+      peers: e.flat.length,
+      median_ape_flat_pct: medianPct(e.flat),
+      median_ape_sized_pct: medianPct(e.sized),
+      sized_wins: e.wins,
+    }));
+}
+
+/**
  * The 5-fold check's summary tables from the accumulators: the per-rule
  * candidate rows, the per-category tilt table, and the flat-vs-sized headline
  * numbers for the multiple alone and for the full formula — now including the
@@ -982,33 +1259,15 @@ interface ValidationAccumulators {
  * overestimate and an underestimate symmetrically.
  */
 function summariseValidation(a: ValidationAccumulators): TiltValidation {
-  const trimmedMean = (es: number[]): number => {
-    const s = [...es].sort((x, y) => x - y).slice(0, Math.floor(es.length * 0.9));
-    return round4((s.reduce((sum, e) => sum + e, 0) / s.length) * 100);
-  };
-  const logMean = (es: number[]): number => round4(es.reduce((sum, e) => sum + e, 0) / es.length);
+  const trimmedMean = trimmedMeanPct;
+  const logMean = meanOf;
   const spearOf = (ps: [number, number][]): number =>
     round4(spearman(ps.map(([v]) => v), ps.map(([, t]) => t)));
   const withinPct = (n: number): number => round4((n / a.peerCount) * 100);
-  const byCategory: CategoryValidation[] = [...a.byCatErr.entries()]
-    .sort((x, y) => (x[0] < y[0] ? -1 : 1))
-    .map(([category, e]) => ({
-      category,
-      peers: e.flat.length,
-      median_ape_flat_pct: medianPct(e.flat),
-      median_ape_sized_pct: medianPct(e.sized),
-      sized_wins: e.wins,
-    }));
-  const candidates: CandidateCheck[] = a.rules.map((candidate, ri) => ({
-    candidate,
-    median_ape_pct: medianPct(a.errs[ri]!),
-    trimmed_mean_ape_pct: trimmedMean(a.errs[ri]!),
-    wins: a.wins[ri]!,
-    peers: a.peerCount,
-    spearman: spearOf(a.pairs[ri]!),
-    log_mae: logMean(a.logErrs[ri]!),
-    within2x_pct: withinPct(a.within[ri]!),
-  }));
+  const byCategory: CategoryValidation[] = categoryRows(a.byCatErr);
+  const candidates: CandidateCheck[] = a.rules.map((candidate, ri) =>
+    candidateRow(candidate, a.errs[ri]!, a.logErrs[ri]!, a.pairs[ri]!, a.within[ri]!, a.wins[ri]!, a.peerCount),
+  );
   return {
     median_ape_flat_pct: medianPct(a.errs[0]!),
     median_ape_sized_pct: medianPct(a.errs[1]!),
@@ -1048,6 +1307,72 @@ function summariseValidation(a: ValidationAccumulators): TiltValidation {
     by_category: byCategory,
     candidates,
   };
+}
+
+/** One held-out token's eight prices under a fold's context and calibrators. */
+interface TestTokenPrices {
+  flat: number;
+  pooled: number;
+  percat: number;
+  withinPred: number;
+  full: number;
+  fullFlat: number;
+  fullCal: number;
+  calMultPred: number;
+}
+
+/**
+ * The fold's two calibrators, fitted on inner out-of-fold predictions of the
+ * training peers only — the held-out tokens never touch this fit. One for the
+ * multiple alone, one for the full formula: the calibrated multiple and the
+ * calibrated full formula are measured separately, so each layer's gain is
+ * its own number and the validation can say which layer earned it.
+ */
+function fitFoldCalibrators(
+  train: SnapshotProtocol[],
+  model: ModelConstants,
+  asOf: string,
+): { calMult: Calibrator; calFull: Calibrator } {
+  const inner = oofPredictions(train, model, asOf);
+  const calMult = fitCalibrator(
+    inner.map((o) => [Math.log10(o.multiple), Math.log10(o.trueValue)] as [number, number]),
+    model,
+  );
+  const calFull = fitCalibrator(
+    inner.map((o) => [Math.log10(o.full), Math.log10(o.trueValue)] as [number, number]),
+    model,
+  );
+  return { calMult, calFull };
+}
+
+/**
+ * One held-out token priced eight ways under a fold: the flat category
+ * median, the pooled tilt, the per-category tilt, the within-category slope,
+ * the shipped full formula, the flat median with the multipliers, and the
+ * two calibrated versions. All eight prices come from the same context, so
+ * the per-rule errors the loop accumulates compare models, not draws — the
+ * same token, the same fold, eight different pricings.
+ */
+function priceTestToken(
+  p: SnapshotProtocol,
+  ctx: FoldContext,
+  calMult: Calibrator,
+  calFull: Calibrator,
+  model: ModelConstants,
+  asOf: string,
+): TestTokenPrices {
+  const med = ctx.catMedian(p.category);
+  const pooledTilt = tiltFrom(p.tvl_usd, ctx.pooledFit.slope_damped, ctx.pooledFit.median_tvl_usd, ctx);
+  const flat = p.tvl_usd * med;
+  const pooled = p.tvl_usd * clampMultiple(med * pooledTilt, ctx.model);
+  const fc = ctx.perCatFit(p.category);
+  const percat = p.tvl_usd * clampMultiple(med * tiltFrom(p.tvl_usd, fc.slopeDamped, fc.refTvl, ctx), ctx.model);
+  const withinPred = p.tvl_usd * clampMultiple(med * tiltFrom(p.tvl_usd, ctx.withinSlopeDamped, ctx.pooledFit.median_tvl_usd, ctx), ctx.model);
+  const full = fullFormulaValue(p, med, pooledTilt, ctx.model, asOf);
+  const fullFlat = fullFormulaValue(p, med, 1, ctx.model, asOf);
+  const fullCal = calibrateValue(full, calFull).value;
+  const calMultPred = calibrateValue(pooled, calMult).value;
+  return { flat, pooled, percat, withinPred, full, fullFlat, fullCal, calMultPred };
 }
 
 /**
@@ -1092,42 +1417,60 @@ export function validateModel(sortedPeers: SnapshotProtocol[], model: ModelConst
   let fullFlatWithin = 0;
   const byCatErr = new Map<string, { flat: number[]; sized: number[]; wins: number }>();
 
+  /**
+   * One held-out token's six rule prices into the error lists: the APE, the
+   * log-space error and the (price, truth) pair per rule, the within-twice
+   * count, and the wins against the flat median — the flat error is the one
+   * baseline for every rule, computed once per token instead of once per
+   * rule, so no rule's win is judged against a different flat price.
+   */
+  const recordRules = (preds: number[], trueV: number, flat: number): void => {
+    const flatErr = Math.abs(flat - trueV) / trueV;
+    preds.forEach((pred, ri) => {
+      const e = Math.abs(pred - trueV) / trueV;
+      errs[ri]!.push(e);
+      logErrs[ri]!.push(Math.abs(Math.log10(pred) - Math.log10(trueV)));
+      pairs[ri]!.push([pred, trueV]);
+      if (pred >= trueV / 2 && pred <= trueV * 2) within[ri]!++;
+      if (ri > 0 && e < flatErr) wins[ri]!++;
+    });
+  };
+
+  /**
+   * One held-out token's per-category error lists, for the table that breaks
+   * the tilt's median error down by category: the flat error and the pooled
+   * tilt's error, and whether the tilt won this token. The table tracks the
+   * shipped (pooled) tilt against flat, so a global win cannot hide a
+   * category the tilt loses in.
+   */
+  const recordCategoryError = (p: SnapshotProtocol, flat: number, pooled: number, trueV: number): void => {
+    const catKey = p.category ?? 'Uncategorised';
+    const ce = byCatErr.get(catKey) ?? { flat: [], sized: [], wins: 0 };
+    const eFlat = Math.abs(flat - trueV) / trueV;
+    const eSized = Math.abs(pooled - trueV) / trueV;
+    ce.flat.push(eFlat);
+    ce.sized.push(eSized);
+    if (eSized < eFlat) ce.wins++;
+    byCatErr.set(catKey, ce);
+  };
+
   for (let fold = 0; fold < 5; fold++) {
     const test = sortedPeers.filter((_, i) => i % 5 === fold);
     const train = sortedPeers.filter((_, i) => i % 5 !== fold);
     const ctx = buildFoldContext(train, model);
-    // The fold's calibrators, fitted on inner out-of-fold predictions of the
-    // training peers only — the held-out tokens below never touch this fit.
-    const inner = oofPredictions(train, model, asOf);
-    const calMult = fitCalibrator(
-      inner.map((o) => [Math.log10(o.multiple), Math.log10(o.trueValue)] as [number, number]),
-      model,
-    );
-    const calFull = fitCalibrator(
-      inner.map((o) => [Math.log10(o.full), Math.log10(o.trueValue)] as [number, number]),
-      model,
-    );
+    const { calMult, calFull } = fitFoldCalibrators(train, model, asOf);
     for (const p of test) {
-      const med = ctx.catMedian(p.category);
-      const flat = p.tvl_usd * med;
-      const pooled = p.tvl_usd * clampMultiple(med * tiltFrom(p.tvl_usd, ctx.pooledFit.slope_damped, ctx.pooledFit.median_tvl_usd, ctx), ctx.model);
-      const fc = ctx.perCatFit(p.category);
-      const percat = p.tvl_usd * clampMultiple(med * tiltFrom(p.tvl_usd, fc.slopeDamped, fc.refTvl, ctx), ctx.model);
-      const withinPred = p.tvl_usd * clampMultiple(med * tiltFrom(p.tvl_usd, ctx.withinSlopeDamped, ctx.pooledFit.median_tvl_usd, ctx), ctx.model);
-      const full = fullFormulaValue(p, med, tiltFrom(p.tvl_usd, ctx.pooledFit.slope_damped, ctx.pooledFit.median_tvl_usd, ctx), ctx.model, asOf);
-      const fullFlat = fullFormulaValue(p, med, 1, ctx.model, asOf);
-      const fullCal = calibrateValue(full, calFull).value;
-      const calMultPred = calibrateValue(pooled, calMult).value;
+      const { flat, pooled, percat, withinPred, full, fullFlat, fullCal, calMultPred } = priceTestToken(
+        p,
+        ctx,
+        calMult,
+        calFull,
+        model,
+        asOf,
+      );
       const preds = [flat, pooled, percat, withinPred, full, fullCal];
       const trueV = p.mcap_usd!;
-      preds.forEach((pred, ri) => {
-        const e = Math.abs(pred - trueV) / trueV;
-        errs[ri]!.push(e);
-        logErrs[ri]!.push(Math.abs(Math.log10(pred) - Math.log10(trueV)));
-        pairs[ri]!.push([pred, trueV]);
-        if (pred >= trueV / 2 && pred <= trueV * 2) within[ri]!++;
-        if (ri > 0 && e < Math.abs(flat - trueV) / trueV) wins[ri]!++;
-      });
+      recordRules(preds, trueV, flat);
       const eCal = Math.abs(calMultPred - trueV) / trueV;
       calErrs.push(eCal);
       calLogErrs.push(Math.abs(Math.log10(calMultPred) - Math.log10(trueV)));
@@ -1139,15 +1482,7 @@ export function validateModel(sortedPeers: SnapshotProtocol[], model: ModelConst
       fullFlatLog.push(Math.abs(Math.log10(fullFlat) - Math.log10(trueV)));
       fullFlatPairs.push([fullFlat, trueV]);
       if (fullFlat >= trueV / 2 && fullFlat <= trueV * 2) fullFlatWithin++;
-      // The per-category table tracks the shipped (pooled) tilt against flat.
-      const catKey = p.category ?? 'Uncategorised';
-      const ce = byCatErr.get(catKey) ?? { flat: [], sized: [], wins: 0 };
-      const eFlat = Math.abs(flat - trueV) / trueV;
-      const eSized = Math.abs(pooled - trueV) / trueV;
-      ce.flat.push(eFlat);
-      ce.sized.push(eSized);
-      if (eSized < eFlat) ce.wins++;
-      byCatErr.set(catKey, ce);
+      recordCategoryError(p, flat, pooled, trueV);
     }
   }
 
@@ -1173,6 +1508,32 @@ export function validateModel(sortedPeers: SnapshotProtocol[], model: ModelConst
 }
 
 /**
+ * What the calibration did to the out-of-fold predictions it was fitted on:
+ * the log error, the median error and the trimmed mean error before and after
+ * the layer, on the same predictions. The after-numbers are the fitted
+ * layer's view of the predictions it was fitted on — the honest measure is
+ * the nested validation, and the dashboard says which is which. `most_shrunk`
+ * is filled in later by buildBoard, once the board rows exist.
+ */
+export function summariseCalibration(oof: OofPrediction[], calibrator: Calibrator): CalibrationReport {
+  const beforeErrs = oof.map((o) => Math.abs(o.full - o.trueValue) / o.trueValue);
+  const beforeLog = oof.map((o) => Math.abs(Math.log10(o.full) - Math.log10(o.trueValue)));
+  const afterVals = oof.map((o) => calibrateValue(o.full, calibrator).value);
+  const afterErrs = oof.map((o, i) => Math.abs(afterVals[i]! - o.trueValue) / o.trueValue);
+  const afterLog = oof.map((o, i) => Math.abs(Math.log10(afterVals[i]!) - Math.log10(o.trueValue)));
+  return {
+    calibrator,
+    oof_log_mae_before: meanOf(beforeLog),
+    oof_log_mae_after: meanOf(afterLog),
+    oof_median_ape_before_pct: medianPct(beforeErrs),
+    oof_median_ape_after_pct: medianPct(afterErrs),
+    oof_trimmed_mean_ape_before_pct: trimmedMeanPct(beforeErrs),
+    oof_trimmed_mean_ape_after_pct: trimmedMeanPct(afterErrs),
+    most_shrunk: [],
+  };
+}
+
+/**
  * Calibrate the category multiples and the size tilt from the snapshot's own live-token
  * protocols, and fit the board's calibration layer on out-of-fold predictions of
  * those same peers. Nothing here names a protocol: the tables are whatever the
@@ -1193,7 +1554,7 @@ export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL): Ca
   const medianTvl = median(peers.map((p) => p.tvl_usd).sort((a, b) => a - b)) ?? 1;
   const powerLaw: PowerLawFit = {
     slope: round4(fit.slope),
-    slope_damped: round4(1 + (fit.slope - 1) * model.size_damping),
+    slope_damped: round4(dampedSlope(fit.slope, model)),
     r2: round4(fit.r2),
     peers: peers.length,
     median_tvl_usd: medianTvl,
@@ -1204,25 +1565,7 @@ export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL): Ca
     oof.map((o) => [Math.log10(o.full), Math.log10(o.trueValue)] as [number, number]),
     model,
   );
-  const beforeErrs = oof.map((o) => Math.abs(o.full - o.trueValue) / o.trueValue);
-  const beforeLog = oof.map((o) => Math.abs(Math.log10(o.full) - Math.log10(o.trueValue)));
-  const afterVals = oof.map((o) => calibrateValue(o.full, calibrator).value);
-  const afterErrs = oof.map((o, i) => Math.abs(afterVals[i]! - o.trueValue) / o.trueValue);
-  const afterLog = oof.map((o, i) => Math.abs(Math.log10(afterVals[i]!) - Math.log10(o.trueValue)));
-  const trimmedMeanPct = (es: number[]): number => {
-    const s = [...es].sort((x, y) => x - y).slice(0, Math.floor(es.length * 0.9));
-    return round4((s.reduce((sum, e) => sum + e, 0) / s.length) * 100);
-  };
-  const calibrationReport: CalibrationReport = {
-    calibrator,
-    oof_log_mae_before: round4(beforeLog.reduce((a, b) => a + b, 0) / beforeLog.length),
-    oof_log_mae_after: round4(afterLog.reduce((a, b) => a + b, 0) / afterLog.length),
-    oof_median_ape_before_pct: medianPct(beforeErrs),
-    oof_median_ape_after_pct: medianPct(afterErrs),
-    oof_trimmed_mean_ape_before_pct: trimmedMeanPct(beforeErrs),
-    oof_trimmed_mean_ape_after_pct: trimmedMeanPct(afterErrs),
-    most_shrunk: [],
-  };
+  const calibrationReport = summariseCalibration(oof, calibrator);
   return {
     market_median: round4(marketMedian),
     live_count: peers.length,
@@ -1268,23 +1611,20 @@ export function impliedValue(
 } {
   const multiple = multipleFor(protocol, calibration, model);
   const tilt = sizeTilt(protocol.tvl_usd, calibration.power_law, model);
-  const fitted = clampMultiple(multiple.multiple * tilt, model);
-  const m = multipliersFor(protocol, model, asOf);
-  const base = protocol.tvl_usd * fitted;
-  const raw = Math.max(1, Math.round(base * m.growth * m.maturity * m.chain));
-  const cal = calibrateValue(raw, calibration.calibration);
+  const parts = pricingParts(protocol, multiple.multiple, tilt, model, asOf);
+  const cal = calibrateValue(parts.raw, calibration.calibration);
   return {
     implied: cal.value,
-    raw,
+    raw: parts.raw,
     shiftDex: cal.shiftDex,
     multiple,
     tilt,
-    fitted,
-    growthPct: m.growthPct,
-    growthMult: m.growth,
-    maturityMult: m.maturity,
-    chainMult: m.chain,
-    age: m.age,
+    fitted: parts.fitted,
+    growthPct: parts.growthPct,
+    growthMult: parts.growthMult,
+    maturityMult: parts.maturityMult,
+    chainMult: parts.chainMult,
+    age: parts.age,
   };
 }
 
@@ -1361,20 +1701,32 @@ function toBoardRow(s: ScoredProtocol, rank: number, tiltR2: number): BoardRow {
 }
 
 /**
- * The protocols the board ranks, strongest first, with ranks 1..n — ranked by the
- * CALIBRATED value, because that is the number the board shows and the judge reads.
- * The calibration report's most-shrunk table is filled in here from the finished
- * rows, so the calibration object the dashboard carries is the one the board
- * actually used.
+ * The board's protocols, scored and ranked strongest first: every protocol
+ * the board ranks, priced by its calibrated implied value, in descending
+ * order with the slug as the tiebreak so the ranking is deterministic even
+ * when two protocols price identically. Scoring and ranking live here, apart
+ * from the row-building below, so the board's order is one function's job.
  */
-export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; calibration: Calibration } {
-  const calibration = calibrate(snapshot, model);
+function scoreBoardProtocols(
+  snapshot: Snapshot,
+  calibration: Calibration,
+  model: ModelConstants,
+): ScoredProtocol[] {
   const scored = chooseBoardProtocols(snapshot).map((p) => {
     const v = impliedValue(p, snapshot.as_of, calibration, model);
     return { p, ...v };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
-  const board = scored.map((s, i) => toBoardRow(s, i + 1, calibration.power_law.r2));
+  return scored;
+}
+
+/**
+ * The calibration report's most-shrunk table, from the finished board rows:
+ * the ten rows the layer moved the farthest in either direction, farthest
+ * first, slug as the tiebreak. The calibration object the dashboard carries
+ * is the one the board actually used, complete with this table.
+ */
+function fillMostShrunk(board: BoardRow[], calibration: Calibration): void {
   calibration.calibration_report.most_shrunk = [...board]
     .sort(
       (a, b) =>
@@ -1389,6 +1741,20 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): {
       calibrated_implied_value_usd: r.implied_value_usd,
       shift_dex: r.model.calibration_shift_dex,
     }));
+}
+
+/**
+ * The protocols the board ranks, strongest first, with ranks 1..n — ranked by the
+ * CALIBRATED value, because that is the number the board shows and the judge reads.
+ * The calibration report's most-shrunk table is filled in here from the finished
+ * rows, so the calibration object the dashboard carries is the one the board
+ * actually used.
+ */
+export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; calibration: Calibration } {
+  const calibration = calibrate(snapshot, model);
+  const scored = scoreBoardProtocols(snapshot, calibration, model);
+  const board = scored.map((s, i) => toBoardRow(s, i + 1, calibration.power_law.r2));
+  fillMostShrunk(board, calibration);
   return { board, calibration };
 }
 
@@ -1819,6 +2185,37 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   return { board, radar };
 }
 
+/**
+ * One protocol out of a snapshot file's raw entry: the slug, the name and
+ * the TVL are required and must be finite, because a board row without them
+ * cannot be ranked or priced; every other field is optional and falls back
+ * to null (or an empty chain list) when it is missing or the wrong type,
+ * because a snapshot that omits a listing date is thin, not broken. The
+ * index in the error is the entry's position in the file, so a bad entry
+ * can be found without counting.
+ */
+export function parseProtocol(v: unknown, i: number): SnapshotProtocol {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) {
+    throw new SnapshotError(`snapshot.json's protocol ${i} is not an object`);
+  }
+  const p = v as Record<string, unknown>;
+  if (typeof p.slug !== 'string' || typeof p.name !== 'string' || typeof p.tvl_usd !== 'number' || !Number.isFinite(p.tvl_usd)) {
+    throw new SnapshotError(`snapshot.json's protocol ${i} lacks a slug, a name or a TVL`);
+  }
+  return {
+    slug: p.slug,
+    name: p.name,
+    category: typeof p.category === 'string' ? p.category : null,
+    chains: Array.isArray(p.chains) ? p.chains.filter((c): c is string => typeof c === 'string') : [],
+    tvl_usd: p.tvl_usd,
+    change_7d: typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : null,
+    mcap_usd: typeof p.mcap_usd === 'number' && Number.isFinite(p.mcap_usd) ? p.mcap_usd : null,
+    listed_at: typeof p.listed_at === 'string' ? p.listed_at : null,
+    gecko_id: typeof p.gecko_id === 'string' ? p.gecko_id : null,
+    symbol: typeof p.symbol === 'string' ? p.symbol : null,
+  };
+}
+
 /** The snapshot out of a file's text, refused unless it is the shape the model scores. */
 export function parseSnapshot(text: string): Snapshot {
   let raw: unknown;
@@ -1834,25 +2231,7 @@ export function parseSnapshot(text: string): Snapshot {
   if (typeof o.floor_usd !== 'number' || !Number.isSafeInteger(o.floor_usd) || o.floor_usd <= 0) throw new SnapshotError('snapshot.json has no floor_usd');
   if (!Array.isArray(o.protocols)) throw new SnapshotError('snapshot.json has no protocols array');
   if (!Array.isArray(o.watchlist) || o.watchlist.some((s) => typeof s !== 'string')) throw new SnapshotError('snapshot.json has no watchlist of slugs');
-  const protocols = o.protocols.map((v, i) => {
-    if (typeof v !== 'object' || v === null || Array.isArray(v)) throw new SnapshotError(`snapshot.json's protocol ${i} is not an object`);
-    const p = v as Record<string, unknown>;
-    if (typeof p.slug !== 'string' || typeof p.name !== 'string' || typeof p.tvl_usd !== 'number' || !Number.isFinite(p.tvl_usd)) {
-      throw new SnapshotError(`snapshot.json's protocol ${i} lacks a slug, a name or a TVL`);
-    }
-    return {
-      slug: p.slug,
-      name: p.name,
-      category: typeof p.category === 'string' ? p.category : null,
-      chains: Array.isArray(p.chains) ? p.chains.filter((c): c is string => typeof c === 'string') : [],
-      tvl_usd: p.tvl_usd,
-      change_7d: typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : null,
-      mcap_usd: typeof p.mcap_usd === 'number' && Number.isFinite(p.mcap_usd) ? p.mcap_usd : null,
-      listed_at: typeof p.listed_at === 'string' ? p.listed_at : null,
-      gecko_id: typeof p.gecko_id === 'string' ? p.gecko_id : null,
-      symbol: typeof p.symbol === 'string' ? p.symbol : null,
-    };
-  });
+  const protocols = o.protocols.map(parseProtocol);
   return {
     as_of: o.as_of,
     source: o.source,
@@ -1860,6 +2239,25 @@ export function parseSnapshot(text: string): Snapshot {
     protocols,
     watchlist: o.watchlist as string[],
   };
+}
+
+/**
+ * One board row's own gate failures, or null: the farm-step count, every
+ * step's length, and the implied value's shape. Kept apart from the
+ * board-wide checks (coverage, ranks, order, the shared-value check) so a
+ * row's failure names the row instead of the board — the report says which
+ * slug to fix, not just that something is wrong.
+ */
+function rowIssue(r: BoardRow): string | null {
+  const steps = r.farm_steps;
+  if (steps.length < 3 || steps.length > 12) return `${r.slug} has ${steps.length} farm steps`;
+  for (const s of steps) {
+    if (s.length < 20 || s.length > 600) return `${r.slug} has a farm step of ${s.length} characters`;
+  }
+  if (!Number.isSafeInteger(r.implied_value_usd) || r.implied_value_usd <= 0) {
+    return `${r.slug} has implied value ${r.implied_value_usd}`;
+  }
+  return null;
 }
 
 /** Why a board is not one the gate will take, or null: coverage, ranks, order, one shared implied value, and farm steps. */
@@ -1875,10 +2273,8 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
     return `all ${board.length} rows share the same implied value $${board[0]!.implied_value_usd}: a board that ranks nothing by value is not a ranking`;
   }
   for (const r of board) {
-    const steps = r.farm_steps;
-    if (steps.length < 3 || steps.length > 12) return `${r.slug} has ${steps.length} farm steps`;
-    for (const s of steps) if (s.length < 20 || s.length > 600) return `${r.slug} has a farm step of ${s.length} characters`;
-    if (!Number.isSafeInteger(r.implied_value_usd) || r.implied_value_usd <= 0) return `${r.slug} has implied value ${r.implied_value_usd}`;
+    const issue = rowIssue(r);
+    if (issue !== null) return issue;
   }
   return null;
 }
